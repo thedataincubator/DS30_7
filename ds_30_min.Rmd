@@ -1,0 +1,362 @@
+---
+title: "Data Science in 30 Minutes"
+subtitle: "Lessons From the Election with Betterment"
+author: "Sam Swift <swift@betterment.com>"
+date: 2017-04-04
+output:
+  html_document:
+    theme: cosmo
+---
+
+Demo of investor behavior analysis during the 2016 presidential election.
+[Accompanying slides here](https://docs.google.com/presentation/d/1fOKTOe56aYkUz_h0IlBJutiIAbznG4NbTK1DdnfkGfM/edit?usp=sharing)
+
+```{r setup, warning=F, message=FALSE}
+library(data.table)   # fast and memory-efficient tabular data manipulation
+library(lubridate)    # date & time tools
+library(googlesheets) # for reproducibly sourcing small data from google sheets
+library(magrittr)     # for 'piping' series of processing steps together with %>%
+library(scales)       # for convenient formatting of percentages and dollars
+library(ggplot2)      # for making plots
+library(betterutils)  # Betterment's internal R package for data access
+
+options(default.data.type = "data.table")
+
+kMinDate   <- as.Date("2016-10-01",          tz = "US/Eastern")
+kMaxDate   <- as.Date("2016-11-11",          tz = "US/Eastern")
+kEventDate <- ymd_hms("2016-11-08 20:00:00", tz = "US/Eastern")
+
+```
+
+```{r data_collection, warning=F, message=FALSE}
+####~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#### Get Data ####
+####~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+### Publicly available data
+
+# FIPS codes are a census identifier for counties
+fips.census <- fread("http://www2.census.gov/geo/docs/reference/codes/files/national_county.txt")
+
+
+# many:many mapping of counties to zip codes, retrieved from since defunct website,
+# archived in a Betterment google sheet
+zips.gs <- gs_key("1ULGonpLFsUosqO4sYHb3qY0Fg31Zdij3mh5tZko-zUQ") %>%
+  gs_read(ws = "ZIP_COUNTY_062015") %>%
+  data.table
+
+# county level 2016 presidentail election results
+# compiled by townhall.com
+# scraped and made machine-readable by Tony McGovern
+# https://github.com/tonmcg/County_Level_Election_Results_12-16
+votes.gh <- fread("https://raw.githubusercontent.com/tonmcg/County_Level_Election_Results_12-16/master/US_County_Level_Presidential_Results_08-16.csv")
+
+### Proprietary Betterment data
+
+# Betterment customers with zip codes and date ranges
+# users.db <- queryDB(
+#    "SELECT user_id,
+#            user_address_postal_code AS zip_code,
+#            user_initial_deposit_date,
+#            user_defunded_datetime
+#     FROM ... WHERE ...")
+#  
+# saveRDS(users.db, file = file.path(kDataPath, "users.Rds"))
+
+users.db <- readRDS("data/users.Rds")
+
+# Allocation Changes made by each user, the primary behavior of interest
+# alloc.db <- queryDB(paste0(
+#   "SELECT transaction_id,
+#           user_id,
+#           from_allocation,
+#           to_allocation,
+#           transaction_created_datetime,
+#           valid_from_date_id,
+#           valid_to_date_id
+#   FROM ...
+#   LEFT JOIN ...
+#   WHERE ...
+#   AND valid_from_date_id >= ",dateToDateId(kMinDate),"
+#   AND valid_from_date_id <= ",dateToDateId(kMaxDate)))
+#
+#  saveRDS(alloc.db, file = file.path(kDataPath, "allocation_changes.Rds"))
+
+alloc.db <- readRDS("data/allocation_changes.Rds")
+
+```
+
+```{r clean_transform, warning=F, message=FALSE}
+
+####~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#### Clean and Transform ####
+####~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+### clean FIPS
+fips <- copy(fips.census)
+setnames(fips, c("state","state_id","county_id","county","fips_class"))
+# pad county_ids with leading 0's
+fips[, fips := paste0(state_id, sprintf("%03d", county_id))]
+
+### clean zips
+zips <- zips.gs[, c(1,2), with = F]
+setnames(zips, c("zip_code","fips"))
+# pad zip codes with leading 0's
+zips[, zip_code := sprintf("%05d", zip_code)]
+
+# votes to vote share
+votes <- votes.gh[, .(fips = fips_code,
+                      dem_two_party_share_16 = dem_2016 / (dem_2016 + gop_2016))]
+
+# merge zips and votes
+zips <- merge(zips, votes,
+              by = "fips", all.x = T)
+
+# summarize vote share per zip code since zip <--> fips is many to many
+votes.zip <- zips[!is.na(dem_two_party_share_16),
+                  list(n_counties = .N,
+                       mean_dem_share = mean(dem_two_party_share_16)),
+                  by = zip_code]
+
+# merge each user with the vote share in their zip
+users <- merge(users.db,
+               votes.zip[, .(zip_code, mean_dem_share)],
+               by = "zip_code", all.x = T)
+users[, fund_date := as.Date(user_initial_deposit_date)]
+users[, defund_date := as.Date(user_defunded_datetime)]
+users[is.na(defund_date), defund_date := as.Date("2099-12-31")]
+
+# Create political lean factor
+users[, dem_share_bin := cut(mean_dem_share,
+                             breaks = c(0,.3,.45,.55,.7, 1),
+                             labels = c("R 70%+","R 55-70%", "50±5%", "D 55-70%", "D 70%+"))]
+
+users[, party := cut(mean_dem_share,
+                             breaks = c(0,.40,.60, 1),
+                             labels = c("R 55%+","50±5%", "D 55%+"))]
+
+# Combine user information with allocation changes
+alloc <- alloc.db[as.Date(transaction_created_datetime) >= kMinDate,
+                  .(user_id = broker_dealer_owner_user_id,
+                      from_allocation,
+                      to_allocation,
+                      transaction_created_datetime = ymd_hms(transaction_created_datetime,
+                                                             tz = "US/Eastern"))]
+alloc <- merge(alloc, users, by = "user_id", all.x = T)
+alloc[, round_date_time := roundDatetime(transaction_created_datetime, 60)]
+```
+
+```{r summarize, warning=F, message=FALSE}
+
+####~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#### Merge and Summarize ####
+####~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+### Establish population size to normalize action frequencies
+CountCustomers <- function(report.date, 
+                           selected.party = users[, na.omit(unique(party))]){
+  users[party %in% selected.party &
+          fund_date < report.date &
+          defund_date > report.date, .N]
+}
+
+# Overall customer count
+size.date <- expand.grid(report_date = seq.Date(kMinDate, kMaxDate, by = "days")) %>%
+  data.table %>%
+  .[, row_id := 1:.N] %>%
+  .[, n_customers := CountCustomers(report_date), by = row_id]
+
+# Customer count by policital geography
+size.date.party <- expand.grid(report_date   = seq.Date(kMinDate, kMaxDate, by = "days"),
+                               party = users[, na.omit(unique(party))]) %>%
+  data.table %>%
+  .[, row_id := 1:.N] %>%
+  .[, n_customers := CountCustomers(report_date, party), by = row_id]
+
+### Allocation change frequency and rate
+alloc.roundtime <- alloc[, .(n_alloc = .N),
+                         by = .(round_date_time)] %>%
+  .[, report_date := as.Date(round_date_time)] %>%
+  .[, weekday     := wday(round_date_time)] %>%
+  .[, round_time  := format(round_date_time, "%H:%M")] %>%
+  merge(size.date, by = "report_date", all.x = T) %>%
+  .[, alloc_per_cap := n_alloc / n_customers] %>%
+  .[order(round_date_time)]
+
+alloc.typical <- alloc.roundtime[report_date < kEventDate,
+                                 .(mean_alloc = mean(alloc_per_cap)),
+                                 by = .(weekday, round_time)]
+
+alloc.roundtime <- merge(alloc.roundtime,
+                         alloc.typical,
+                         by = c("weekday", "round_time"),
+                         all.x = T)
+
+# Action frequency by round time and party
+
+alloc.roundtime.party <- alloc[, .(n_alloc = .N),
+                               by = .(round_date_time, party)] %>%
+  .[, report_date := as.Date(round_date_time)] %>%
+  .[, weekday     := wday(round_date_time)] %>%
+  .[, round_time  := format(round_date_time, "%H:%M")] %>%
+  merge(size.date.party, by = c("report_date","party"), all.x = T) %>%
+  .[, alloc_per_cap := n_alloc / n_customers] %>%
+  .[order(round_date_time)]
+
+alloc.roundtime.party <- merge(alloc.roundtime.party,
+                         alloc.typical,
+                         by = c("weekday", "round_time"),
+                         all.x = T)
+
+```
+
+```{r visualize_setup, warning=F, message=FALSE}
+
+####~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#### Visualize ####
+####~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# common graphical elements
+focal.period <- data.table(x_min = ymd_hms("2016-11-08 16:00:00", tz = "US/Eastern"), 
+                           x_max = ymd_hms("2016-11-09 09:30:00", tz = "US/Eastern"))
+
+focal_period_rect <- function(){
+  geom_rect(data = focal.period,
+                               aes(xmin = x_min, 
+                                   xmax = x_max),
+                               ymin = 0,
+                               ymax = .03,
+                               alpha = .3,
+                               fill="grey60")
+} 
+```
+
+
+```{r allocation_change_rate, warning=F, message=FALSE}
+
+alloc.roundtime[between(round_date_time,
+                        kEventDate - hours(48),
+                        kEventDate + hours(48))] %>%
+  ggplot() +
+  focal_period_rect() +
+  geom_line(aes(round_date_time, mean_alloc), linetype = "dashed")+
+  geom_line(aes(round_date_time, alloc_per_cap), size = 1.2) +
+  theme_bw(base_size = 16) +
+  labs(title = "Allocation Change rates",
+       subtitle = "presidential election 2016",
+       y = "% customers per 60 minutes",
+       x = "")
+```
+
+
+```{r alloc_change_rate_party, warning=F, message=FALSE}
+alloc.roundtime.party[between(round_date_time,
+                              kEventDate - hours(48),
+                              kEventDate + hours(48)) &
+                        !is.na(party)] %>%
+  ggplot() +
+  focal_period_rect() +
+  geom_line(aes(round_date_time, mean_alloc), linetype = "dashed")+
+  geom_line(aes(round_date_time, alloc_per_cap, color = party), size = 1.2) +
+  theme_bw(base_size = 16) +
+  theme(legend.position = c(.1,.85)) +
+  scale_color_manual(values = c("#CA0020","#c7c7c7","#0571B0")) +
+  labs(title = "Allocation Change rates",
+       subtitle = "by political geography, presidential election 2016",
+       color = "Home county",
+       y = "% customers per 60 minutes",
+       x = "")
+```
+
+
+```{r alloc_change_direction, warning=F, message=FALSE}
+alloc[party != "50±5%" &
+        between(transaction_created_datetime,
+                kEventDate - hours(48),
+                kEventDate + hours(48)) &
+        !is.na(party)] %>%
+  .[, alloc_delta := to_allocation - from_allocation] %>%
+  ggplot() +
+  focal_period_rect() +
+  geom_hline(yintercept = 0) +
+  geom_segment(aes(x = transaction_created_datetime,
+                   xend = transaction_created_datetime,
+                   y = 0,
+                   yend = alloc_delta,
+                   color = party),
+               alpha = .2) +
+  geom_point(aes(x = transaction_created_datetime,
+                   y = alloc_delta,
+                 color = party),
+               alpha = .2) +
+  facet_grid(party~.) +
+  theme_bw(base_size = 16) +
+  theme(legend.position = "none") +
+  scale_color_manual(values = c("#CA0020","#0571B0")) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Allocation Change direction",
+       subtitle = "by political geography, presidential election 2016",
+       color = "Home county",
+       y = "Change in Stock Allocation %",
+       x = "")
+
+```
+
+```{r alloc_change_distribution, warning=F, message=FALSE}
+
+alloc[!is.na(party) &
+        between(transaction_created_datetime,
+                kEventDate - hours(12),
+                kEventDate + hours(48))] %>%
+  .[, alloc_delta := to_allocation - from_allocation] %>%
+  ggplot() +
+  geom_rect(data = focal.period,
+            aes(xmin = x_min, 
+                xmax = x_max),
+            ymin = -1,
+            ymax = 1,
+            alpha = .3,
+            fill="grey60") +
+  geom_boxplot(aes(round_date_time, alloc_delta,color = party,
+                   group = paste(round_date_time, party)), outlier.shape = NA) +
+  facet_grid(party~.) +
+  theme_bw(base_size = 16) +
+  theme(legend.position = "none") +
+  scale_color_manual(values = c("#CA0020","#c7c7c7","#0571B0")) +
+  labs(title = "Allocation change distribution",
+       subtitle = "by political geography, presidential election 2016",
+       color = "Home county",
+       y = "Change in Stock Allocation %",
+       x = "")
+```
+
+
+```{r alloc_change_party_smooth, warning=F, message=FALSE}
+alloc[!is.na(party) & party != "50±5%" &
+        between(transaction_created_datetime,
+                kEventDate - hours(12),
+                kEventDate + hours(48))] %>%
+  .[, alloc_delta := to_allocation - from_allocation] %>%
+  ggplot() +
+    geom_hline(yintercept = 0)+
+    geom_rect(data = focal.period,
+            aes(xmin = x_min, 
+                xmax = x_max),
+            ymin = -1,
+            ymax = 1,
+            alpha = .3,
+            fill="grey60") +
+  geom_smooth(aes(round_date_time, alloc_delta,color = party),
+              alpha = .2, level = .9, method = "loess", span = 0.35) +
+  scale_y_continuous(labels = percent)+
+  theme_bw(base_size = 14) +
+  theme(legend.position = c(.085,.9)) +
+  scale_color_manual(values = c("#CA0020","#0571B0")) +
+  labs(title = "Aggregate allocation changes",
+       subtitle = "by political geography, presidential election 2016",
+       color = "Home county",
+       y = "Change in Stock Allocation %",
+       x = "")
+
+```
